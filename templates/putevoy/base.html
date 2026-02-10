@@ -1,0 +1,17 @@
+{% load static %}
+
+{% load static %}
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Volovo</title>
+
+  <!-- пример подключения css -->
+  <link rel="stylesheet" href="{% static 'putevoy/css/app.css' %}">
+</head>
+<body>
+  {% block content %}{% endblock %}
+</body>
+</html>

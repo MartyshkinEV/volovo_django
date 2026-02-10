@@ -1,0 +1,4 @@
+html, body { margin:0; padding:0; font-family: Arial, sans-serif; }
+#map { height: 60vh; min-height: 350px; border:1px solid #ddd; }
+.sheet { width: 100%; border-collapse: collapse; }
+.sheet td, .sheet th { border:1px solid #ccc; padding:4px; font-size:12px; }
