@@ -263,17 +263,13 @@
       <td class="center thick-r"></td>
       <td class="right thick-r"></td>
 
-      <!-- 36: доставка по строке -->
       <td class="right delivery-cell"></td>
-      <!-- 37 -->
       <td></td>
-      <!-- 38 -->
       <td class="right thick-r"></td>
 
       <td class="thick-l"></td><td></td>
     </tr>
 
-    <!-- 2..8 -->
     <tr class="data-row">
       <td class="thick-r"><select class="route"></select></td>
       <td class="center thick-r">2</td><td></td>
@@ -364,11 +360,8 @@
       <td class="center thick-r" id="trips_count_cell">—</td>
       <td class="center thick-r" id="total_tons_cell">—</td>
 
-      <!-- 36: ИТОГО доставка -->
       <td class="right" id="ttd_km_delivery_cell"></td>
-      <!-- 37 -->
       <td></td>
-      <!-- 38: ИТОГО холостой -->
       <td class="right thick-r" id="ttd_38_idle_cell"></td>
 
       <td class="thick-l"></td><td></td>
@@ -446,6 +439,36 @@
   const stat = document.getElementById("stat");
   const mapInfo = document.getElementById("mapInfo");
 
+  // ---- DEFAULT DATETIME (00:00 -> 23:59) ----
+  function toDatetimeLocalValue(d){
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+  function setDefaultDayBounds(){
+    const now = new Date();
+    const from = new Date(now); from.setHours(0, 0, 0, 0);
+    const to = new Date(now);   to.setHours(23, 59, 0, 0);
+
+    // не затираем, если браузер уже восстановил значения
+    if (dtFrom && !dtFrom.value) dtFrom.value = toDatetimeLocalValue(from);
+    if (dtTo && !dtTo.value) dtTo.value = toDatetimeLocalValue(to);
+  }
+  setDefaultDayBounds();
+
+  // фиксируем время при выборе даты (по желанию — оставил включенным)
+  dtFrom.addEventListener("change", () => {
+    if(!dtFrom.value) return;
+    const d = new Date(dtFrom.value);
+    d.setHours(0,0,0,0);
+    dtFrom.value = toDatetimeLocalValue(d);
+  });
+  dtTo.addEventListener("change", () => {
+    if(!dtTo.value) return;
+    const d = new Date(dtTo.value);
+    d.setHours(23,59,0,0);
+    dtTo.value = toDatetimeLocalValue(d);
+  });
+
   // итоги
   const totalKmPointsCell = document.getElementById("total_km_points_cell"); // GPS total (из API)
   const totalKmSumCell = document.getElementById("total_km_sum_cell");       // расчётный км по введённым тоннам
@@ -474,6 +497,7 @@
 
   function dtLocalToApi(v){
     if(!v) return "";
+    // datetime-local: "YYYY-MM-DDTHH:MM" -> "YYYY-MM-DD HH:MM:00"
     return v.replace("T"," ") + ":00";
   }
 
@@ -513,10 +537,13 @@
   }
 
   // ---- MAP ----
-  const map = L.map("map").setView([52.05, 37.99], 11);
-  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-    maxZoom: 19,
-    attribution: "&copy; OpenStreetMap"
+  const map = L.map("map", { attributionControl: false }).setView([52.05, 37.99], 11);
+
+
+  // attribution пустая -> убирает подпись/значок внизу
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19,
+  attribution: ''
   }).addTo(map);
 
   const TRIP_COLORS = [
@@ -642,11 +669,10 @@
     totalTonsSumCell.textContent = fmt2(totalTons);
     totalKmSumCell.textContent = fmt2(totalKm);
 
-    recalcDeliveryAndIdleTotals(); // ✅ итоги доставки/холостого
+    recalcDeliveryAndIdleTotals();
   }
 
   // ✅ ИТОГО доставка: (общий тоннаж авто / тоннаж авто) * 16
-  // где "общий тоннаж авто" = totalTonsCell (например "518 т")
   function recalcDeliveryAndIdleTotals(){
     const vTonnage = getVehicleTonnage();
     const totalTonsAuto = parseTonsCellTextToNumber(totalTonsCell.textContent);
@@ -762,7 +788,6 @@
     wireRouteSelects();
     wireTonsInputs();
 
-    // пересчёт сразу
     const rows = Array.from(document.querySelectorAll("tr.data-row"));
     rows.forEach(r => recalcRowDelivery(r));
     recalcTotals();
@@ -797,7 +822,6 @@
       oidSelect.appendChild(opt);
     }
 
-    // ✅ при смене авто — пересчёт доставки по строкам и итогов
     oidSelect.addEventListener("change", () => {
       const rows = Array.from(document.querySelectorAll("tr.data-row"));
       rows.forEach(r => recalcRowDelivery(r));
@@ -867,7 +891,6 @@
     tripsCountCell.textContent = String(tripsCount);
     totalTonsCell.textContent = vehicleTonnage ? (totalTonsAuto.toFixed(0) + " т") : "—";
 
-    // ✅ пересчёт итогов (по твоей формуле)
     recalcDeliveryAndIdleTotals();
 
     const sb = tripsData.sand_base;
@@ -925,7 +948,6 @@
       `точек (в базе: ${tripsData.original_count}, после фильтра: ${tripsData.filtered_count}, скачков удалено: ${tripsData.gps_jumps_removed}), ` +
       `мин. длина рейса: ${minTripKm} км`;
 
-    // ✅ пересчёт строк доставки/итогов
     const rows = Array.from(document.querySelectorAll("tr.data-row"));
     rows.forEach(r => recalcRowDelivery(r));
     recalcTotals();
@@ -942,10 +964,7 @@
       const width = row.querySelector(".js-width")?.textContent?.trim() || "";
       const length = row.querySelector(".js-length")?.textContent?.trim() || "";
       const pssTonnage = row.querySelector(".js-tons")?.textContent?.trim() || "";
-
-      // ✅ доставка ПО СТРОКЕ
       const delivery = row.querySelector(".delivery-cell")?.textContent?.trim() || "";
-
       return { route, tripNo, km, tons, width, length, pssTonnage, delivery };
     });
 
@@ -959,7 +978,6 @@
         km_spread: totalKmSumCell.textContent?.trim() || "",
         tons_sum: totalTonsSumCell.textContent?.trim() || "",
         km_gps: totalKmPointsCell.textContent?.trim() || "",
-        // ✅ итоги (теперь в строке ИТОГО)
         delivery: ttdKmDeliveryCell?.textContent?.trim() || "",
         idle: ttd38IdleCell?.textContent?.trim() || ""
       },

@@ -15,3 +15,19 @@ env/
 
 # OS files
 .DS_Store
+# Python
+__pycache__/
+*.py[cod]
+
+# Envs
+.venv/
+venv/
+
+# Django
+*.log
+db.sqlite3
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/

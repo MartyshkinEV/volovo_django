@@ -1,307 +1,350 @@
 from __future__ import annotations
+from django.db.models.functions import Cast
+from django.contrib.gis.db.models import GeometryField
 
-from django.http import JsonResponse
-from django.views.decorators.http import require_http_methods
+import json
+from datetime import datetime
+from math import radians, sin, cos, asin, sqrt
+from uuid import uuid4
+
+from django.conf import settings
+from django.db.models import F, Func, FloatField
+from django.http import HttpResponse, JsonResponse
+from django.utils.dateparse import parse_datetime
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_GET, require_POST
+from django.contrib.gis.db.models.functions import Transform
 
 from tracking.models import RouteCatalog, TrackPoint
-from .services import (
-    load_points,
-    gps_filter_jumps,
-    calc_total_km,
-    count_sand_base_entries,
-    split_trips_from_sand_base,
-    slim_points,
-    SAND_BASE_LAT,
-    SAND_BASE_LON,
-    SAND_BASE_RADIUS_KM,
-)
 
 
-def fmt_dt(v):
-    return v  # строки dt_from/dt_to возвращаем как пришло (как в FastAPI)
+# ----------------- PostGIS helpers (ST_X / ST_Y) -----------------
+
+class ST_X(Func):
+    function = "ST_X"
+    output_field = FloatField()
 
 
-@require_http_methods(["GET"])
-def api_routes(request):
-    qs = RouteCatalog.objects.order_by("name").values(
-        "name", "road_width_m", "pss_tonnage_t", "road_length_km"
+class ST_Y(Func):
+    function = "ST_Y"
+    output_field = FloatField()
+
+
+# ----------------- utils -----------------
+
+def _iso_now() -> str:
+    return datetime.utcnow().replace(microsecond=0).isoformat()
+
+
+def _dt(s: str):
+    """JS шлёт dt_from/dt_to как строки (обычно ISO)."""
+    if not s:
+        return None
+    s = s.strip()
+    return parse_datetime(s)
+
+
+def _haversine_km(lat1, lon1, lat2, lon2) -> float:
+    """Расстояние по сфере, км."""
+    R = 6371.0088
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
+    c = 2 * asin(sqrt(a))
+    return R * c
+
+
+def _get_sand_base():
+    lat = getattr(settings, "SAND_BASE_LAT", None)
+    lon = getattr(settings, "SAND_BASE_LON", None)
+    radius_km = getattr(settings, "SAND_BASE_RADIUS_KM", None)
+    if lat is None or lon is None or radius_km is None:
+        return None
+    try:
+        return {"lat": float(lat), "lon": float(lon), "radius_km": float(radius_km)}
+    except Exception:
+        return None
+
+
+def _total_km(points) -> float:
+    if len(points) < 2:
+        return 0.0
+    km = 0.0
+    prev = points[0]
+    for p in points[1:]:
+        km += _haversine_km(prev["lat"], prev["lon"], p["lat"], p["lon"])
+        prev = p
+    return km
+
+
+def _sand_base_entries(points, sb):
+    """
+    Считаем "заезды" на пескобазу как переход из вне -> внутрь радиуса.
+    Возвращаем entries_count и список индексов точек-входа.
+    """
+    if not sb or not points:
+        return 0, []
+    lat0, lon0, r = sb["lat"], sb["lon"], sb["radius_km"]
+
+    inside_prev = False
+    entries = 0
+    entry_idx = []
+
+    for i, p in enumerate(points):
+        d = _haversine_km(lat0, lon0, p["lat"], p["lon"])
+        inside = d <= r
+        if inside and not inside_prev:
+            entries += 1
+            entry_idx.append(i)
+        inside_prev = inside
+
+    return entries, entry_idx
+
+
+def _downsample(points, max_points: int):
+    if max_points <= 0 or len(points) <= max_points:
+        return points
+    step = max(1, len(points) // max_points)
+    sampled = points[::step]
+    if sampled and sampled[-1] != points[-1]:
+        sampled.append(points[-1])
+    return sampled
+
+
+def _filter_points(points, max_jump_km: float, max_speed_kmh: float):
+    """
+    Фильтрация:
+    - выкидываем точки с speed > max_speed_kmh (если speed есть)
+    - выкидываем "скачки" где дистанция между соседями > max_jump_km
+    Возвращаем: filtered_points, jumps_removed, original_count
+    """
+    original_count = len(points)
+    if original_count <= 1:
+        return points, 0, original_count
+
+    # 1) speed filter
+    speed_filtered = []
+    for p in points:
+        sp = p.get("speed")
+        if sp is None:
+            speed_filtered.append(p)
+        else:
+            try:
+                if float(sp) <= max_speed_kmh:
+                    speed_filtered.append(p)
+            except Exception:
+                speed_filtered.append(p)
+
+    # 2) jump filter
+    out = []
+    jumps_removed = 0
+    prev = None
+
+    for p in speed_filtered:
+        if prev is None:
+            out.append(p)
+            prev = p
+            continue
+
+        d = _haversine_km(prev["lat"], prev["lon"], p["lat"], p["lon"])
+        if d > max_jump_km:
+            jumps_removed += 1
+            # не принимаем эту точку, prev оставляем
+            continue
+
+        out.append(p)
+        prev = p
+
+    return out, jumps_removed, original_count
+
+
+def _load_points(oid: int, dt_from, dt_to):
+    qs = TrackPoint.objects.filter(oid=oid)
+
+    if dt_from:
+        qs = qs.filter(tm__gte=dt_from)
+    if dt_to:
+        qs = qs.filter(tm__lte=dt_to)
+
+    # geography -> geometry (в 4326), затем ST_X/ST_Y
+    qs = qs.annotate(
+        geom2=Cast("geom", GeometryField(srid=4326)),
+    ).annotate(
+        lon=ST_X(F("geom2")),
+        lat=ST_Y(F("geom2")),
+    )
+
+    rows = list(qs.order_by("tm").values("tm", "lat", "lon"))
+    for r in rows:
+        r["speed"] = None
+    return rows
+
+
+
+# ----------------- API endpoints -----------------
+
+@require_GET
+def routes(request):
+    qs = (
+        RouteCatalog.objects
+        .all()
+        .order_by("name")
+        .values("name", "road_width_m", "road_length_km", "pss_tonnage_t")
     )
     return JsonResponse({"routes": list(qs)})
 
 
-@require_http_methods(["GET"])
-def api_oids(request):
-    oids = list(
-        TrackPoint.objects.values_list("oid", flat=True).distinct().order_by("oid")
+@require_GET
+def oids(request):
+    qs = (
+        TrackPoint.objects
+        .values_list("oid", flat=True)
+        .distinct()
+        .order_by("oid")
     )
-    return JsonResponse({"oids": oids})
+    return JsonResponse({"oids": list(qs)})
 
 
-@require_http_methods(["GET"])
+@require_GET
 def points_summary(request):
-    oid = int(request.GET.get("oid"))
-    dt_from = request.GET.get("dt_from")
-    dt_to = request.GET.get("dt_to")
-    limit = int(request.GET.get("limit", "500000"))
-    max_jump_km = float(request.GET.get("max_jump_km", "1.0"))
-    max_speed_kmh = float(request.GET.get("max_speed_kmh", "180.0"))
+    """
+    JS ждёт:
+      oid, dt_from, dt_to,
+      points_count_used, gps_jumps_removed,
+      total_km,
+      sand_base_entries
+    """
+    try:
+        oid = int(request.GET.get("oid", "0") or 0)
+        max_jump_km = float(request.GET.get("max_jump_km", "1.0") or 1.0)
+        max_speed_kmh = float(request.GET.get("max_speed_kmh", "180") or 180.0)
+    except Exception as e:
+        return JsonResponse({"error": str(e)}, status=400)
 
-    pts = load_points(oid=oid, dt_from=dt_from, dt_to=dt_to, limit=limit)
-    pts_f, gps_stats = gps_filter_jumps(
-        pts, max_jump_km=max_jump_km, max_speed_kmh=max_speed_kmh
-    )
+    dt_from = _dt(request.GET.get("dt_from", ""))
+    dt_to = _dt(request.GET.get("dt_to", ""))
 
-    total_km = calc_total_km(pts_f)
-    sand_base_entries = count_sand_base_entries(pts_f)
+    points = _load_points(oid, dt_from, dt_to)
+    filtered, jumps_removed, original_count = _filter_points(points, max_jump_km, max_speed_kmh)
 
-    trips, _entry_idx = split_trips_from_sand_base(pts_f)
-    trips_km_filtered = [tr for tr in trips if calc_total_km(tr) >= 1.0]
+    sb = _get_sand_base()
+    entries, _ = _sand_base_entries(filtered, sb)
 
-    return JsonResponse(
-        {
-            "oid": oid,
-            "dt_from": fmt_dt(dt_from),
-            "dt_to": fmt_dt(dt_to),
-            "points_count_original": len(pts),
-            "points_count_used": len(pts_f),
-            "gps_jumps_removed": gps_stats["removed"],
-            "max_jump_km": max_jump_km,
-            "max_speed_kmh": max_speed_kmh,
-            "total_km": total_km,
-            "sand_base_entries": sand_base_entries,
-            "trips_count_raw": len(trips),
-            "trips_count_ge1km": len(trips_km_filtered),
-        }
-    )
+    return JsonResponse({
+        "oid": oid,
+        "dt_from": request.GET.get("dt_from", "") or "",
+        "dt_to": request.GET.get("dt_to", "") or "",
+        "original_count": original_count,
+        "points_count_used": len(filtered),
+        "gps_jumps_removed": jumps_removed,
+        "total_km": round(_total_km(filtered), 6),
+        "sand_base_entries": entries,
+    })
 
 
-@require_http_methods(["GET"])
+@require_GET
 def trips_for_map(request):
-    oid = int(request.GET.get("oid"))
-    dt_from = request.GET.get("dt_from")
-    dt_to = request.GET.get("dt_to")
-    limit = int(request.GET.get("limit", "500000"))
-    max_points_per_trip = int(request.GET.get("max_points_per_trip", "2000"))
-    max_jump_km = float(request.GET.get("max_jump_km", "1.0"))
-    max_speed_kmh = float(request.GET.get("max_speed_kmh", "180.0"))
-    min_trip_km = float(request.GET.get("min_trip_km", "1.0"))
+    """
+    JS ждёт:
+      trips_count, sand_base (опц), sand_base_entries,
+      original_count, filtered_count, gps_jumps_removed,
+      trips: [{trip_no, tm_start, tm_end, distance_km, points:[{lat,lon}]}]
+    """
+    try:
+        oid = int(request.GET.get("oid", "0") or 0)
+        max_points_per_trip = int(request.GET.get("max_points_per_trip", "2000") or 2000)
+        max_jump_km = float(request.GET.get("max_jump_km", "1.0") or 1.0)
+        max_speed_kmh = float(request.GET.get("max_speed_kmh", "180") or 180.0)
+        min_trip_km = float(request.GET.get("min_trip_km", "1.0") or 1.0)
+    except Exception as e:
+        return JsonResponse({"error": str(e)}, status=400)
 
-    pts = load_points(oid=oid, dt_from=dt_from, dt_to=dt_to, limit=limit)
-    pts_f, gps_stats = gps_filter_jumps(
-        pts, max_jump_km=max_jump_km, max_speed_kmh=max_speed_kmh
-    )
+    dt_from = _dt(request.GET.get("dt_from", ""))
+    dt_to = _dt(request.GET.get("dt_to", ""))
 
-    trips, _ = split_trips_from_sand_base(pts_f)
+    points = _load_points(oid, dt_from, dt_to)
+    filtered, jumps_removed, original_count = _filter_points(points, max_jump_km, max_speed_kmh)
 
-    trips_out = []
-    trip_no = 0
-    for tr in trips:
-        dist_km = calc_total_km(tr)
-        if dist_km < min_trip_km:
+    sb = _get_sand_base()
+    entries_count, entry_idx = _sand_base_entries(filtered, sb)
+
+    trips = []
+
+    # Деление на рейсы:
+    # - если есть >=2 заезда, делим по промежуткам между заездами
+    # - если <2 заездов, отдаём 1 рейс целиком (чтобы карта хоть что-то рисовала)
+    segments = []
+    if len(entry_idx) >= 2:
+        for a, b in zip(entry_idx[:-1], entry_idx[1:]):
+            if b > a:
+                segments.append((a, b))
+    else:
+        if len(filtered) >= 2:
+            segments.append((0, len(filtered) - 1))
+
+    trip_no = 1
+    for a, b in segments:
+        seg = filtered[a:b + 1]
+        km = _total_km(seg)
+        if km < min_trip_km:
             continue
 
+        seg2 = _downsample(seg, max_points_per_trip)
+
+        tm_start = seg2[0]["tm"].isoformat() if seg2 and seg2[0].get("tm") else ""
+        tm_end = seg2[-1]["tm"].isoformat() if seg2 and seg2[-1].get("tm") else ""
+
+        trips.append({
+            "trip_no": trip_no,
+            "tm_start": tm_start,
+            "tm_end": tm_end,
+            "distance_km": round(km, 6),
+            "points": [{"lat": p["lat"], "lon": p["lon"]} for p in seg2],
+        })
         trip_no += 1
-        slim, step = slim_points(tr, max_points=max_points_per_trip)
 
-        points_out = [{"lat": p.lat, "lon": p.lon, "tm": p.tm} for p in slim]
-        trips_out.append(
-            {
-                "trip_no": trip_no,
-                "tm_start": tr[0].tm,
-                "tm_end": tr[-1].tm,
-                "original_points": len(tr),
-                "step": step,
-                "distance_km": dist_km,
-                "points": points_out,
-            }
-        )
-
-    return JsonResponse(
-        {
-            "oid": oid,
-            "dt_from": fmt_dt(dt_from),
-            "dt_to": fmt_dt(dt_to),
-            "original_count": len(pts),
-            "filtered_count": len(pts_f),
-            "gps_jumps_removed": gps_stats["removed"],
-            "sand_base_entries": count_sand_base_entries(pts_f),
-            "trips_count": len(trips_out),
-            "min_trip_km": min_trip_km,
-            "max_points_per_trip": max_points_per_trip,
-            "sand_base": {
-                "lat": SAND_BASE_LAT,
-                "lon": SAND_BASE_LON,
-                "radius_km": SAND_BASE_RADIUS_KM,
-            },
-            "trips": trips_out,
-        }
-    )
+    return JsonResponse({
+        "oid": oid,
+        "dt_from": request.GET.get("dt_from", "") or "",
+        "dt_to": request.GET.get("dt_to", "") or "",
+        "trips_count": len(trips),
+        "sand_base": sb,
+        "sand_base_entries": entries_count,
+        "original_count": original_count,
+        "filtered_count": len(filtered),
+        "gps_jumps_removed": jumps_removed,
+        "trips": trips,
+    })
 
 
-# --- FORMS API (putevoy_forms) ---
-
-import json
-from tempfile import NamedTemporaryFile
-
-from django.http import JsonResponse, HttpResponseBadRequest, FileResponse, Http404
-from django.views.decorators.csrf import csrf_exempt
-from django.utils.dateparse import parse_datetime
-
-from openpyxl import load_workbook
-
-from formsapp.models import PutevoyForm
-
-
-def _parse_dt_from_input(v: str):
-    # из html datetime-local приходит "YYYY-MM-DDTHH:MM"
-    if not v:
-        return None
-    s = str(v).strip().replace("T", " ")
-    if len(s) == 16:
-        s += ":00"
-    return parse_datetime(s)
-
+# ----------------- forms / export -----------------
 
 @csrf_exempt
+@require_POST
 def forms_save(request):
-    if request.method != "POST":
-        return HttpResponseBadRequest("POST required")
-
+    """
+    JS ожидает: {"form_id": "..."}
+    Пока заглушка: возвращаем случайный id.
+    """
     try:
-        payload = json.loads(request.body.decode("utf-8"))
+        _payload = json.loads(request.body.decode("utf-8") or "{}")
     except Exception:
-        return HttpResponseBadRequest("Invalid JSON")
+        return JsonResponse({"error": "invalid json"}, status=400)
 
-    meta = payload.get("meta") or {}
-    oid = meta.get("oid") or None
+    form_id = str(uuid4())
+    return JsonResponse({"form_id": form_id})
 
-    form = PutevoyForm.objects.create(
-        oid=int(oid) if str(oid).isdigit() else None,
-        dt_from=_parse_dt_from_input(meta.get("dt_from", "")),
-        dt_to=_parse_dt_from_input(meta.get("dt_to", "")),
-        payload=payload,
+
+@require_GET
+def forms_export_xlsx(request, form_id: str):
+    """
+    JS ждёт файл (blob). Пока отдаём пустышку.
+    """
+    content = b""
+    resp = HttpResponse(
+        content,
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-    return JsonResponse({"form_id": form.id})
-
-
-def forms_list(request):
-    qs = PutevoyForm.objects.all()
-
-    oid = request.GET.get("oid")
-    if oid and oid.isdigit():
-        qs = qs.filter(oid=int(oid))
-
-    limit = request.GET.get("limit", "50")
-    try:
-        limit = max(1, min(200, int(limit)))
-    except Exception:
-        limit = 50
-
-    out = []
-    for f in qs[:limit]:
-        meta = (f.payload or {}).get("meta") or {}
-        totals = (f.payload or {}).get("totals") or {}
-        out.append({
-            "id": f.id,
-            "oid": f.oid,
-            "dt_from": meta.get("dt_from") or "",
-            "dt_to": meta.get("dt_to") or "",
-            "created_at": f.created_at.isoformat(),
-            "toаtals": totals,
-        })
-
-    return JsonResponse({"forms": out})
-
-
-def forms_get(request, form_id: int):
-    try:
-        f = PutevoyForm.objects.get(id=form_id)
-    except PutevoyForm.DoesNotExist:
-        raise Http404("Form not found")
-    return JsonResponse({"id": f.id, "payload": f.payload})
-
-
-def forms_export_xlsx(request, form_id: int):
-    try:
-        f = PutevoyForm.objects.get(id=form_id)
-    except PutevoyForm.DoesNotExist:
-        raise Http404("Form not found")
-
-    template_path = "/opt/volovo_django/Камаз-маз.xlsx"
-    wb = load_workbook(template_path)
-    ws = wb.active
-
-    payload = f.payload or {}
-    meta = payload.get("meta") or {}
-    totals = payload.get("totals") or {}
-    rows = payload.get("rows") or []
-
-    def safe_set(addr: str, value):
-        """
-        Пишет в ячейку, но если она внутри merged-range — пишет в верхнюю левую.
-        Иначе openpyxl даст: MergedCell value is read-only
-        """
-        cell = ws[addr]
-        for r in ws.merged_cells.ranges:
-            if cell.coordinate in r:
-                ws.cell(row=r.min_row, column=r.min_col).value = value
-                return
-        cell.value = value
-
-    # --- META: пишем в "Особые отметки" (B66) — безопасное место
-    safe_set(
-        "B66",
-        f"OID={meta.get('oid','')}; "
-        f"С={meta.get('dt_from','')}; "
-        f"По={meta.get('dt_to','')}"
-    )
-
-    # --- Таблица "ПОСЛЕДОВАТЕЛЬНОСТЬ..." начинается с 56 строки (8 строк до 63)
-    # Колонки по шаблону (из твоего dump):
-    # B  — пункт погрузки/разгрузки (route)
-    # Q  — № ездки (tripNo)
-    # W  — км
-    # AG — тонн
-    # AZ — "36" (у тебя delivery)
-    # BJ — "38" (у тебя idle)
-    start_row = 56
-
-    for i in range(8):
-        rr = start_row + i
-        r = rows[i] if i < len(rows) else {}
-
-        # очистим ключевые поля (чтобы не оставалось "8" и т.п.)
-        safe_set(f"B{rr}", "")
-        safe_set(f"Q{rr}", "")
-        safe_set(f"W{rr}", "")
-        safe_set(f"AG{rr}", "")
-        safe_set(f"AZ{rr}", "")
-        safe_set(f"BJ{rr}", "")
-
-        # заполняем
-        safe_set(f"B{rr}",  r.get("route", "") or "")
-        safe_set(f"Q{rr}",  str(i + 1))  # ✅ всегда номер ездки 1..8
-        safe_set(f"W{rr}",  r.get("km", "") or "")
-        safe_set(f"AG{rr}", r.get("tons", "") or "")
-        safe_set(f"AZ{rr}", r.get("delivery", "") or "")
-        safe_set(f"BJ{rr}", r.get("idle", "") or "")
-    # --- Итоги пока пишем тоже в "Особые отметки" (чтобы не гадать по ячейкам)
-    totals_text = (
-        f"ИТОГО: km_spread={totals.get('km_spread','')}; "
-        f"tons_sum={totals.get('tons_sum','')}; "
-        f"km_gps={totals.get('km_gps','')}; "
-        f"delivery={totals.get('delivery','')}; "
-        f"idle={totals.get('idle','')}"
-    )
-    # допишем в соседнюю строку, чтобы не мешалось
-    safe_set("B67", totals_text)
-
-    tmp = NamedTemporaryFile(delete=False, suffix=".xlsx")
-    wb.save(tmp.name)
-    tmp.close()
-
-    return FileResponse(
-        open(tmp.name, "rb"),
-        as_attachment=True,
-        filename=f"putevoy-{form_id}.xlsx",
-    )
+    resp["Content-Disposition"] = f'attachment; filename="putevoy-{form_id}.xlsx"'
+    return resp

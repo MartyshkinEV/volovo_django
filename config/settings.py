@@ -25,10 +25,16 @@ SECRET_KEY = 'django-insecure-(cv%z0^)&@sx1ru6-dp#8fdkinjn-!9cq53be1h7tayz6$@5+t
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ["dorvol.ru", "www.dorvol.ru", "127.0.0.1", "localhost"]
+ALLOWED_HOSTS = [
+    'dorvol.ru',
+    'www.dorvol.ru',
+    '45.137.190.121',
+    '127.0.0.1',
+    'localhost',
+]
 CSRF_TRUSTED_ORIGINS = ["https://dorvol.ru", "https://www.dorvol.ru"]
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
-FORCE_SCRIPT_NAME = "/dj"
+#FORCE_SCRIPT_NAME = "/dj"
 
 # Application definition
 
@@ -86,11 +92,12 @@ DATABASES = {
         "ENGINE": "django.contrib.gis.db.backends.postgis",
         "NAME": "volovo",
         "USER": "volovo_pg",
-        "PASSWORD": "SILNY_PAROL_TUT",
+        "PASSWORD": "123",   # тот пароль, который ты ставил ранее
         "HOST": "127.0.0.1",
         "PORT": "5432",
     }
 }
+
 
 
 # Password validation
@@ -134,3 +141,7 @@ STATIC_ROOT=BASE_DIR / 'static'
 # https://docs.djangoproject.com/en/4.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+# --- Volovo: sand base (пескобаза) ---
+SAND_BASE_LAT = 52.036282      # поменяешь на свои координаты
+SAND_BASE_LON = 37.887833
+SAND_BASE_RADIUS_KM = 0.02# 70 метров как в твоём JS по умолчанию
